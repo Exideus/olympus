@@ -1,31 +1,20 @@
+/**
+ * Autonomous Discuss — Round-robin agent discussion with summary.
+ *
+ * Agents take turns discussing a topic, with token budgeting and timeout.
+ * Claude summarizes at the end. Uses shared modules for LLM calling.
+ */
+
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import type { AgentRecord } from "../_shared/types.ts";
+import { CORS_HEADERS, jsonResponse } from "../_shared/types.ts";
+import { callAgent } from "../_shared/agent-caller.ts";
+import { buildDiscussionContext } from "../_shared/context-builder.ts";
+import { getSupabase } from "../_shared/event-bus.ts";
 
-const supabase = createClient(
-  Deno.env.get("SUPABASE_URL")!,
-  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-);
-
-const KIMI_KEY = Deno.env.get("KIMI_API_KEY") || "";
-const OLLAMA_URL = Deno.env.get("OLLAMA_BASE_URL") || "http://172.29.96.1:11434";
 const MAX_TOKENS_PER_AGENT = 500;
 const MAX_TOTAL_TOKENS = 5000;
 const DISCUSSION_TIMEOUT_MS = 120_000; // 2 minutes
-
-interface AgentRecord {
-  name: string;
-  role: string;
-  session_key: string;
-  api_endpoint: string | null;
-  api_model: string | null;
-  system_prompt: string | null;
-}
-
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, apikey, x-client-info",
-};
 
 serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
@@ -38,6 +27,8 @@ serve(async (req: Request) => {
     const { room_id, topic, deliverable, agents } = await req.json();
     const discussionId = crypto.randomUUID();
     const agentNames: string[] = agents || [];
+
+    const supabase = getSupabase();
 
     // Step 1: Post the discussion header message
     await supabase.from("war_room_messages").insert({
@@ -61,27 +52,17 @@ serve(async (req: Request) => {
 
     const agentMap = new Map<string, AgentRecord>();
     for (const rec of agentRecords || []) {
-      agentMap.set(rec.name, rec);
+      agentMap.set(rec.name, rec as AgentRecord);
     }
 
     // Filter to agents that have endpoints configured
-    const validAgents = agentNames.filter(name => {
+    const validAgents = agentNames.filter((name) => {
       const rec = agentMap.get(name);
       return rec && rec.api_endpoint;
     });
 
     // Step 3: Get recent context
-    const { data: recentMsgs } = await supabase
-      .from("war_room_messages")
-      .select("sender_name, content")
-      .eq("room_id", room_id)
-      .order("created_at", { ascending: false })
-      .limit(10);
-
-    const recentContext = (recentMsgs || [])
-      .reverse()
-      .map(m => `[${m.sender_name}] ${m.content}`)
-      .join("\n");
+    const recentContext = await buildDiscussionContext(room_id, 10);
 
     // Step 4: Round-robin — each agent gets one turn
     const contributions: { agent: string; text: string }[] = [];
@@ -114,9 +95,11 @@ serve(async (req: Request) => {
 
       const rec = agentMap.get(agentName)!;
 
-      const previousContributions = contributions.length > 0
-        ? "\n\nOther agents have already said:\n" + contributions.map(c => `[${c.agent}]: ${c.text}`).join("\n")
-        : "";
+      const previousContributions =
+        contributions.length > 0
+          ? "\n\nOther agents have already said:\n" +
+            contributions.map((c) => `[${c.agent}]: ${c.text}`).join("\n")
+          : "";
 
       const systemPrompt = `You are ${agentName}, a ${rec.role} in the OLYMPUS team. You are in a focused team discussion.
 
@@ -130,12 +113,16 @@ ${previousContributions}
 Share your perspective concisely. Stay on topic. Don't repeat what others said. Focus on your area of expertise. Max 3-4 sentences.`;
 
       try {
-        const response = await callAgent(rec, systemPrompt, `Discuss: ${topic}`);
+        const response = await callAgent(
+          rec,
+          systemPrompt,
+          `Discuss: ${topic}`,
+          MAX_TOKENS_PER_AGENT,
+          30000
+        );
         totalTokens += response.tokensUsed;
-
         contributions.push({ agent: agentName, text: response.text });
 
-        // Insert discussion message
         await supabase.from("war_room_messages").insert({
           room_id,
           sender_name: agentName,
@@ -148,14 +135,12 @@ Share your perspective concisely. Stay on topic. Don't repeat what others said. 
             tokens_used: response.tokensUsed,
           },
         });
-
       } catch (err) {
         console.error(`Discussion: ${agentName} failed:`, err);
-        // Skip this agent, continue with others
       }
     }
 
-    // Step 5: Claude summarizes (always use Anthropic for summary)
+    // Step 5: Claude summarizes
     if (contributions.length > 0) {
       const summaryPrompt = `You are Claude, the team moderator. Summarize this team discussion and provide the deliverable.
 
@@ -163,7 +148,7 @@ TOPIC: ${topic}
 DELIVERABLE REQUESTED: ${deliverable}
 
 CONTRIBUTIONS:
-${contributions.map(c => `[${c.agent}]: ${c.text}`).join("\n\n")}
+${contributions.map((c) => `[${c.agent}]: ${c.text}`).join("\n\n")}
 
 Write a concise summary (2-3 paragraphs max) that:
 1. Captures the key points from each contributor
@@ -185,7 +170,8 @@ Address the human directly. Start with: "Here's what we discussed:"`;
             body: JSON.stringify({
               model: "claude-sonnet-4-5-20250929",
               max_tokens: 1024,
-              system: "You are Claude, a thoughtful team moderator who synthesizes discussions into actionable summaries.",
+              system:
+                "You are Claude, a thoughtful team moderator who synthesizes discussions into actionable summaries.",
               messages: [{ role: "user", content: summaryPrompt }],
             }),
           });
@@ -204,7 +190,9 @@ Address the human directly. Start with: "Here's what we discussed:"`;
                 discussion_summary: true,
                 discussion_id: discussionId,
                 model_used: "claude-sonnet-4-5-20250929",
-                tokens_used: (data.usage?.input_tokens || 0) + (data.usage?.output_tokens || 0),
+                tokens_used:
+                  (data.usage?.input_tokens || 0) +
+                  (data.usage?.output_tokens || 0),
               },
             });
           }
@@ -214,134 +202,17 @@ Address the human directly. Start with: "Here's what we discussed:"`;
       }
     }
 
-    return new Response(
-      JSON.stringify({
-        status: "ok",
-        discussion_id: discussionId,
-        agents_participated: contributions.length,
-        total_tokens: totalTokens,
-      }),
-      { status: 200, headers: { "Content-Type": "application/json", ...CORS_HEADERS } }
-    );
-
+    return jsonResponse({
+      status: "ok",
+      discussion_id: discussionId,
+      agents_participated: contributions.length,
+      total_tokens: totalTokens,
+    });
   } catch (err) {
     console.error("autonomous-discuss error:", err);
-    return new Response(
-      JSON.stringify({ error: (err as Error).message }),
-      { status: 500, headers: { "Content-Type": "application/json", ...CORS_HEADERS } }
-    );
+    return new Response(JSON.stringify({ error: (err as Error).message }), {
+      status: 500,
+      headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+    });
   }
 });
-
-// ============================================================
-// Agent caller (reusable across providers)
-// ============================================================
-
-interface AgentResponse {
-  text: string;
-  tokensUsed: number;
-}
-
-async function callAgent(rec: AgentRecord, systemPrompt: string, message: string): Promise<AgentResponse> {
-  const endpoint = rec.api_endpoint!;
-
-  if (endpoint.includes("anthropic.com")) {
-    const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
-    if (!apiKey) throw new Error("ANTHROPIC_API_KEY not set");
-
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: rec.api_model || "claude-sonnet-4-5-20250929",
-        max_tokens: MAX_TOKENS_PER_AGENT,
-        system: systemPrompt,
-        messages: [{ role: "user", content: message }],
-      }),
-      signal: AbortSignal.timeout(30000),
-    });
-
-    if (!res.ok) throw new Error(`Anthropic error ${res.status}`);
-    const data = await res.json();
-    return {
-      text: data.content[0].text,
-      tokensUsed: (data.usage?.input_tokens || 0) + (data.usage?.output_tokens || 0),
-    };
-
-  } else if (endpoint.includes("moonshot.cn")) {
-    const key = KIMI_KEY;
-    if (!key) throw new Error("KIMI_API_KEY not set");
-
-    const res = await fetch("https://api.moonshot.cn/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${key}`,
-      },
-      body: JSON.stringify({
-        model: rec.api_model || "moonshot-v1-auto",
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: message },
-        ],
-        max_tokens: MAX_TOKENS_PER_AGENT,
-      }),
-      signal: AbortSignal.timeout(30000),
-    });
-
-    if (!res.ok) throw new Error(`Kimi error ${res.status}`);
-    const data = await res.json();
-    return {
-      text: data.choices[0].message.content,
-      tokensUsed: data.usage?.total_tokens || 0,
-    };
-
-  } else if (endpoint.includes("localhost") || endpoint.includes("172.") || endpoint.includes("ollama")) {
-    const res = await fetch(`${OLLAMA_URL}/api/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: rec.api_model || "qwen2.5-coder:32b",
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: message },
-        ],
-        stream: false,
-      }),
-      signal: AbortSignal.timeout(60000),
-    });
-
-    if (!res.ok) throw new Error(`Ollama error ${res.status}`);
-    const data = await res.json();
-    return {
-      text: data.message.content,
-      tokensUsed: (data.eval_count || 0) + (data.prompt_eval_count || 0),
-    };
-
-  } else {
-    const res = await fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: rec.api_model || "gpt-4",
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: message },
-        ],
-        max_tokens: MAX_TOKENS_PER_AGENT,
-      }),
-      signal: AbortSignal.timeout(30000),
-    });
-
-    if (!res.ok) throw new Error(`API error ${res.status}`);
-    const data = await res.json();
-    return {
-      text: data.choices?.[0]?.message?.content || "No response",
-      tokensUsed: data.usage?.total_tokens || 0,
-    };
-  }
-}
