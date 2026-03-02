@@ -28,7 +28,7 @@ export function MessageBubble({ message, isOwnMessage }: Props) {
   });
   const isVoiceTranscribed = message.metadata?.voice_transcribed;
   const [isPlaying, setIsPlaying] = useState(false);
-  const [showTranscript, setShowTranscript] = useState(!message.audio_url); // Collapsed by default if audio exists
+  const [showTranscript, setShowTranscript] = useState(true); // Always show text — audio is supplemental, not replacement
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
   return (

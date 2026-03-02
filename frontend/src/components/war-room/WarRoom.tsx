@@ -57,6 +57,10 @@ export function WarRoom({ roomId }: Props) {
   const [mentionIndex, setMentionIndex] = useState(0);
   // Command palette state
   const [showCommandPalette, setShowCommandPalette] = useState(false);
+  // Voice reply toggle — off by default, persisted in localStorage
+  const [voiceReplyEnabled, setVoiceReplyEnabled] = useState(() => {
+    try { return localStorage.getItem('war-room-voice-reply') === 'true'; } catch { return false; }
+  });
   const inputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -185,6 +189,7 @@ export function WarRoom({ roomId }: Props) {
           room_id: roomId,
           target_agents: [agentName],
           content: lastHumanMessageRef.current,
+          prefer_voice: voiceReplyEnabled,
         }),
       });
       if (!res.ok) {
@@ -220,6 +225,7 @@ export function WarRoom({ roomId }: Props) {
           room_id: roomId,
           target_agents: raisedAgents,
           content: lastHumanMessageRef.current,
+          prefer_voice: voiceReplyEnabled,
         }),
       });
       if (!res.ok) {
@@ -330,12 +336,14 @@ export function WarRoom({ roomId }: Props) {
     const isQuestioning = mentionPattern.test(inputText) ||
                          /\b(stimmt das|is that correct|really|sure)\??/i.test(inputText);
 
+    const voiceMeta = voiceReplyEnabled ? { prefer_voice_reply: true } : {};
+
     if (isQuestioning) {
       setIsIntervening(true);
-      await sendMessage(inputText, { requires_verification: true, intervention: true });
+      await sendMessage(inputText, { requires_verification: true, intervention: true, ...voiceMeta });
       setIsIntervening(false);
     } else {
-      await sendMessage(inputText);
+      await sendMessage(inputText, voiceMeta);
     }
 
     setInputText('');
@@ -647,6 +655,24 @@ export function WarRoom({ roomId }: Props) {
                 <span className="hidden sm:inline">Discussing...</span>
               </button>
             )}
+
+            {/* Voice reply toggle */}
+            <button
+              onClick={() => {
+                const next = !voiceReplyEnabled;
+                setVoiceReplyEnabled(next);
+                try { localStorage.setItem('war-room-voice-reply', String(next)); } catch {}
+              }}
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-mono transition-colors ${
+                voiceReplyEnabled
+                  ? 'border-primary/40 bg-[rgba(184,150,90,0.15)] text-primary'
+                  : 'border-border bg-[rgba(22,22,32,0.6)] text-text-secondary hover:border-primary/40 hover:text-primary'
+              }`}
+              title={voiceReplyEnabled ? 'Agent voice replies ON — click to disable' : 'Agent voice replies OFF — click to enable'}
+            >
+              <span className="text-sm">{voiceReplyEnabled ? '🔊' : '🔇'}</span>
+              <span className="hidden sm:inline uppercase tracking-[0.1em]">{voiceReplyEnabled ? 'Voice' : 'Text'}</span>
+            </button>
 
             {/* Mobile: Participants button */}
             <button

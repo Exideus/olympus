@@ -32,11 +32,12 @@ serve(async (req: Request) => {
       audio_url,
       action,
       target_agents,
+      prefer_voice,
     } = body;
 
     // ---- ACTION: full_response (frontend requests specific agent responses) ----
     if (action === "full_response") {
-      return await handleFullResponse(room_id, content, target_agents || []);
+      return await handleFullResponse(room_id, content, target_agents || [], !!prefer_voice);
     }
 
     // ---- DEFAULT: triggered by DB webhook on human message ----
@@ -95,8 +96,11 @@ serve(async (req: Request) => {
       .filter((m) => m.type === "agent")
       .map((m) => m.name);
 
+    // Determine voice preference from the triggering message's metadata
+    const triggeringMsgVoice = content_type === "voice" || body.metadata?.prefer_voice_reply === true;
+
     if (mentionedAgents.length > 0) {
-      return await handleFullResponse(room_id, messageText, mentionedAgents);
+      return await handleFullResponse(room_id, messageText, mentionedAgents, triggeringMsgVoice);
     }
 
     // If only humans were mentioned, no agent response needed
@@ -107,10 +111,10 @@ serve(async (req: Request) => {
       });
     }
 
-    // Step 3b: Voice messages — all agents respond directly
+    // Step 3b: Voice messages — all agents respond directly (with voice reply)
     if (content_type === "voice") {
       const allAgentNames = agentParticipants.map((a) => a.participant_name);
-      return await handleFullResponse(room_id, messageText, allAgentNames);
+      return await handleFullResponse(room_id, messageText, allAgentNames, true);
     }
 
     // Step 4: Hand-raise mode — ask all agents if they want to speak
@@ -171,7 +175,8 @@ serve(async (req: Request) => {
 async function handleFullResponse(
   roomId: string,
   messageText: string,
-  targetAgents: string[]
+  targetAgents: string[],
+  preferVoice = false
 ): Promise<Response> {
   if (targetAgents.length === 0) {
     return jsonResponse({ status: "no_targets" });
@@ -248,8 +253,14 @@ async function handleFullResponse(
           .select()
           .single();
 
-        // Voice TTS if agent has a voice_id configured
-        if (agentRecord?.voice_id && insertedMsg) {
+        // Voice TTS: only when explicitly requested, agent has voice_id,
+        // and response doesn't contain code (code read aloud is useless)
+        const hasCodeBlocks = response.text.includes("```") || /`[^`]+`/.test(response.text);
+        const usedCodeTool = response.toolsUsed.includes("commit_code");
+        const shouldGenerateVoice =
+          preferVoice && agentRecord?.voice_id && insertedMsg && !hasCodeBlocks && !usedCodeTool;
+
+        if (shouldGenerateVoice) {
           try {
             await generateVoice(
               response.text,
